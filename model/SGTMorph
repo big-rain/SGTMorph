@@ -1,0 +1,541 @@
+#!/usr/bin/env python
+# -*- coding: utf-8 -*-
+# @Time    : 2024/1/15 16:49
+# @Author  : ShengPengpeng
+# @File    : byol.py
+# @Description :
+
+
+from dataloader.ACT import ACTDatset
+from dataloader.N7 import N7dataset
+from dataloader.BIL import BILdataset
+from model.linear import compute_representations, train_linear, load_trained_encoder
+from tran.lr_scheduler import CosineDecayScheduler
+from tran.transformer import get_graph_transformer, MultiViewDataInjector
+from tran.transform_t2 import Augmentor_Transform, MyAug_Identity
+
+import seaborn as sns
+
+from sklearn.manifold import TSNE
+
+import os
+import copy
+import logging
+import inspect
+import random
+import numpy as np
+import matplotlib.pyplot as plt
+from typing import Any, Dict, Optional
+
+
+import json
+import torch
+from tqdm import tqdm
+import torch.nn as nn
+from torch import Tensor
+from torch.optim import AdamW
+import torch.nn.functional as F
+from torch.nn.functional import cosine_similarity
+from torch.utils.tensorboard import SummaryWriter
+
+import torch_geometric.transforms as T
+from torch_geometric.typing import Adj
+from torch_geometric.nn.inits import reset
+from torch_geometric.loader import DataLoader
+from torch_geometric.utils import to_dense_batch
+from torch_geometric.nn.conv import MessagePassing
+from torch_geometric.nn import GINEConv, GPSConv, GATConv, ResGatedGraphConv
+from torch_geometric.nn.resolver import activation_resolver, normalization_resolver
+from torch_geometric.nn import global_mean_pool, global_add_pool, global_max_pool, global_sort_pool
+
+import warnings
+warnings.filterwarnings('ignore', '.*Sparse CSR tensor support is in beta state.*')
+
+from sklearn.neighbors import KNeighborsClassifier
+
+
+class MLP_Predictor(nn.Module):
+    r"""MLP used for predictor, The MLP has one hidden layer
+
+    Args:
+        input size (int) : size of input features
+        output size (int) : size of output features
+        hidden_size (int, optional): size of hidden layer (default : : object: '4096'
+    """
+
+    def __init__(self, input_size, output_size, hidden_size=512):
+        super().__init__()
+
+        self.net = nn.Sequential(
+            nn.Linear(input_size, hidden_size, bias=True),
+            nn.BatchNorm1d(hidden_size),
+            nn.PReLU(1),
+            nn.Linear(hidden_size, output_size, bias=True),
+        )
+        self.reset_parameters()
+
+    def forward(self, x):
+        return self.net(x)
+
+    def reset_parameters(self):
+        # kaiming_uniform
+        for m in self.modules():
+            if isinstance(m, nn.Linear):
+                m.reset_parameters()
+
+
+class GG_layer(nn.Module):
+    def __init__(self,
+                 channels: int,
+                 conv: Optional[MessagePassing],
+
+                 heads:  int = 4,
+                 dropout: float = 0.0,
+                 attn_dropout: float = 0.5,
+
+                 act: str = 'relu',
+                 act_kwargs: Optional[Dict[str, Any]] = None,
+
+                 # norm: Optional[str] = 'batch_norm',
+                 # norm_kwargs: Optional[Dict[str, Any]] = None,
+                 norm: Optional[str] = 'batch_norm',
+                 norm_kwargs: Optional[Dict[str, Any]] = None,
+
+                 ):
+        super().__init__()
+
+        self.channels = channels
+        self.conv = conv
+        self.heads = heads
+        self.dropout = dropout
+        self.attn_dropout = attn_dropout
+
+        self.attn = torch.nn.MultiheadAttention(
+            channels,
+            heads,
+            batch_first=True,
+            dropout=attn_dropout,
+        )
+
+        self.input_norm = nn.LayerNorm(channels)
+
+        # we follow the paper in that all hidden dims are equal to the embedding dim
+        self.mlp = nn.Sequential(
+            nn.Linear(channels, channels * 2),
+            activation_resolver(act, **(act_kwargs or {})),
+            nn.Dropout(dropout),
+            nn.Linear(channels * 2, channels),
+            nn.Dropout(dropout),
+        )
+
+        norm_kwargs = norm_kwargs or {}
+        self.norm1 = normalization_resolver(norm, channels, **norm_kwargs)
+        self.norm2 = normalization_resolver(norm, channels, **norm_kwargs)
+        self.norm3 = normalization_resolver(norm, channels, **norm_kwargs)
+
+        self.norm_with_batch = False
+        if self.norm1 is not None:
+            signature = inspect.signature(self.norm1.forward)
+            self.norm_with_batch = 'batch' in signature.parameters
+
+    def forward(self,
+                x: Tensor,
+                edge_index: Adj,
+                batch: Optional[torch.Tensor] = None,
+                **kwargs
+                ) -> Tensor:
+
+        hs = []
+        # Local Feature MPNN
+        # print('bbbb', x)
+        if self.conv is not None:
+            h = self.conv(x, edge_index, **kwargs)
+            h = F.dropout(h, p=self.dropout, training=self.training)
+            h = h + x
+            if self.norm1 is not None:
+                if self.norm_with_batch:
+                    h = self.norm1(h, batch=batch)
+                else:
+                    h = self.norm1(h)
+            hs.append(h)
+
+        # global attention
+        # print(x.shape)
+        # print(batch.shape)
+        h, mask = to_dense_batch(x, batch)
+        h, _ = self.attn(h, h, h, key_padding_mask=~mask, need_weights=False)
+        # print(h)
+        h = h[mask]
+        h = F.dropout(h, p=self.dropout, training=self.training)
+        h = h + x     # residual connection
+
+        if self.norm2 is not None:
+            if self.norm_with_batch:
+                h = self.norm2(h, batch=batch)
+            else:
+                h = self.norm2(h)
+        # combine local and global outputs
+        hs.append(h)
+        out = sum(hs)
+        # print(out)
+
+        out = out + self.mlp(out)
+        if self.norm3 is not None:
+            if self.norm_with_batch:
+                out = self.norm3(out, batch=batch)
+            else:
+                out = self.norm3(out)
+        return out
+
+    def __repr__(self) -> str:
+        return (f'{self.__class__.__name__}({self.channels}, conv={self.conv}, heads={self.heads})')
+
+    def reset_parameters(self):
+        r"""Resets all learnable parameters of the module."""
+        if self.conv is not None:
+            self.conv.reset_parameters()
+        self.attn._reset_parameters()
+        reset(self.mlp)
+        if self.norm1 is not None:
+            self.norm1.reset_parameters()
+        if self.norm2 is not None:
+            self.norm2.reset_parameters()
+        if self.norm3 is not None:
+            self.norm3.reset_parameters()
+
+
+class Transformer_encoder(nn.Module):
+    r"""  MPNN + Transformer """
+    def __init__(self,
+                 in_features: int,
+                 channels: int,
+                 pe_dim: int,
+                 num_layer: int,
+                 heads: int,
+                 dropout: float,
+                 attn_dropout: float,
+                 ):
+        super().__init__()
+
+        # 预处理
+        self.node_emb = nn.Linear(in_features, channels - pe_dim)
+
+
+        self.pe_lin = nn.Linear(20, pe_dim)
+        self.pe_norm = nn.BatchNorm1d(20)
+        self.edge_emb = nn.Embedding(32, channels)
+
+        self.convs = nn.ModuleList()
+        for _ in range(num_layer):
+            local_gnn = ResGatedGraphConv(in_channels=channels, out_channels=channels, act=nn.ReLU(), edge_dim=channels)
+            global_nn = GG_layer(channels, local_gnn, heads=heads, dropout=dropout, attn_dropout=attn_dropout)
+            self.convs.append(global_nn)
+
+        self.mlp = nn.Sequential(
+            nn.Linear(channels, channels // 2),
+            nn.ReLU(),
+            # nn.Linear(channels // 2, channels // 2),
+            # nn.ReLU(),
+            nn.Linear(channels // 2, channels),
+        )
+
+    def forward(self,
+                x,
+                pe,
+                edge_index,
+                edge_attr,
+                batch,
+                ):
+
+        x_pe = self.pe_norm(pe)
+        pe_lin = self.pe_lin(x_pe)
+
+        node_emb = self.node_emb(x.squeeze(-1))
+
+        x = torch.cat((node_emb, pe_lin), dim=1)
+        # print(edge_attr)
+        edge_attr = self.edge_emb(edge_attr)
+
+        for conv in self.convs:
+            x = conv(x, edge_index, batch, edge_attr=edge_attr)
+        x = global_mean_pool(x, batch)
+
+        x = self.mlp(x)  # 2024.3.7 改
+        # print(x.shape)
+
+        return x
+
+    def reset_parameters(self):
+        r"""Resets all learnable parameters of the module."""
+        for m in self.convs:
+            m.reset_parameters()
+
+
+
+class byol_gg(nn.Module):
+    def __init__(self, encoder, predictor):
+        super().__init__()
+        # online network
+        self.online_encoder = encoder
+        self.predictor = predictor
+
+        # target network
+        self.target_encoder = copy.deepcopy(encoder)
+
+        # reinitialize weights
+
+        self.target_encoder.reset_parameters()
+        # stop gradient
+        for param in self.target_encoder.parameters():
+            param.requires_grad = False
+
+    def trainable_parameters(self):
+        r"""returns the parameters  update via on an optimizer.  """
+        return list(self.online_encoder.parameters()) + list(self.predictor.parameters())
+
+    @torch.no_grad()
+    def update_target_network(self, mm):
+        r"""Performs a momentum update of the target network's weights
+
+        Args:
+            mm(float): Momentum used in moving average update
+        """
+        assert 0.0 <= mm <= 1.0, 'momentum needs to be between 0.0 and 1.0, got %.5f' % mm
+        for param_q, param_k in zip(self.online_encoder.parameters(), self.target_encoder.parameters()):
+            param_k.data.mul_(mm).add_(param_q.data, alpha=1. - mm)
+
+    def forward(self, online_x, target_x):
+        # forward online network
+        online_y = self.online_encoder(online_x.x, online_x.pe, online_x.edge_index, online_x.edge_attr, online_x.batch)
+
+        # print(online_y.shape)
+        # prediction
+        online_q = self.predictor(online_y)
+
+        # print('online', online_q.shape)
+        # forward target network
+        with torch.no_grad():
+            target_y = self.target_encoder(target_x.x, target_x.pe, target_x.edge_index, target_x.edge_attr, target_x.batch).detach()
+
+        # print('target', target_y.shape)
+
+        return online_q, target_y
+
+
+def get_features_from_encoder(model, loader):
+    latents = []
+    trues = []
+    name = []
+    for data in loader:
+        data = data.cuda()
+        # name = data.cell_id
+        latent = model(data.x, data.pe, data.edge_index, data.edge_attr, data.batch).detach()
+        trues.extend(data.y)
+        latents.extend(latent)
+        # name.extend(data.cell_id)
+
+    x_train = torch.stack(latents)
+    y_train = torch.stack(trues)
+    # name_train = torch.stack(name)
+    return x_train, y_train
+
+
+def plot_tne(name, z, labels, targets, colors=None,):
+    """ Plot t-SNE clustering. """
+    u_labels = np.unique(labels)
+    print(u_labels)
+    fig = plt.figure(1, figsize=(8, 8))
+    # ax = fig.add_subplot(111, projection='3d')
+    for label in u_labels:
+        plt.scatter(z[labels == label, 0],
+                    z[labels == label, 1],
+                   # z[labels == label, 2],
+                    s=20,
+                    label=str(targets[label]),
+                    color=colors[label])
+    plt.legend(bbox_to_anchor=(1,1))
+    plt.axis('off')
+    # plt.savefig(os.path.join('../data/neuron7/clu', name))
+    plt.savefig('../data/BIL/clu/{}.png'.format(name))
+    plt.close()
+
+if __name__ == '__main__':
+
+    config = json.load(open('../config/act.json'))
+    # path  = '../config/bil_t1.json'
+    # config = json.load(open('../config/bil_t1.json'))
+    colors = sns.color_palette()
+    # use CUDA_VISIBLE_DEVICES to select gpu
+    device = torch.device('cuda') if torch.cuda.is_available() else torch.device('cpu')
+    # device = 'cpu'
+    print('Using {} for training.'.format(device))
+
+
+    # setup tensorboard
+    writer = SummaryWriter('../tensorboard')
+
+    # 数据增强随机参数设置
+
+
+    # 数据增强
+    transform_raw = T.AddRandomWalkPE(walk_length=20, attr_name='pe')
+    transformer_view_1 = get_graph_transformer(keep_nodes=500,
+                                               drop_branch=10,
+                                               jitter_scale=0.5,
+                                               trans_scale=10)
+
+    transformer_view_2 = get_graph_transformer(keep_nodes=500,
+                                               drop_branch=10,
+                                               jitter_scale=0.5,
+                                               trans_scale=5)
+
+    transformer_view_3 = get_graph_transformer(keep_nodes=500,
+                                               drop_branch=0,
+                                               jitter_scale=0,
+                                               trans_scale=0)
+
+    path = os.path.join(config['dataset']['data_root'], config['dataset']['dataset_name'])
+    # all_data = BILdataset(path, subset=True, split='all', transform=transform_raw)
+    # all_data = BILdataset(path, split='all', transform=MultiViewDataInjector([transformer_view_1, transformer_view_1]))
+    all_data = ACTDatset(path, split='all', transform=MultiViewDataInjector([transformer_view_1, transformer_view_1]))
+    # all_data = N7dataset(path, split='all', transform=MultiViewDataInjector([transformer_view_1, transformer_view_1]))
+    data_loader = DataLoader(all_data, batch_size=config['train']['batch_size'], shuffle=True)
+
+
+    # train_dataset = BILdataset(path, split='train', transform=transform_raw)
+
+    train_dataset = ACTDatset(path, split='train', transform=transform_raw)
+    train_loader = DataLoader(train_dataset, batch_size=config['train']['batch_size'], shuffle=True)
+
+    # val_dataset = BILdataset(path, split='val', transform=transform_raw)
+    val_dataset = ACTDatset(path, split='val', transform=transform_raw)
+    val_loader = DataLoader(val_dataset, batch_size=config['train']['batch_size'], shuffle=True)
+    # train_dataset = N7dataset(path, subset=True, split='train', transform=transformer_view_3)
+    # train_dataset = N7dataset(path, subset=True, split='train', transform=transformer_view_3)
+    # train_loader = DataLoader(train_dataset, batch_size=config['train']['batch_size'], shuffle=True)
+    # val_dataset = BILdataset(path, subset=True, split='val', transform=transform_raw)
+    # data_loader = DataLoader(list(zip(data_view_1, data_view_2)), batch_size=config['train']['batch_size'], shuffle=True)
+
+
+    print('Dataset {}, graph 0: {}.'.format(all_data.__class__.__name__, all_data[0]))
+    print(len(all_data))
+
+    # build network
+    Encoder = Transformer_encoder(in_features=9,
+                                  channels=config['model']['channels'],
+                                  pe_dim=config['model']['pe_dim'],
+                                  num_layer=config['model']['layers'],
+                                  heads=config['model']['heads'],
+                                  dropout=config['model']['dropout'],
+                                  attn_dropout=config['model']['attn_dropout'])
+
+
+    # 参数待修改
+    Predictor = MLP_Predictor(input_size=config['model']['channels'],
+                              output_size=config['model']['channels'],
+                              hidden_size=config['model']['channels'])
+
+    model = byol_gg(Encoder, Predictor).to(device)
+
+    # optimizer
+    optimizer = AdamW(model.trainable_parameters(), lr=0., weight_decay=config['train']['weight_decay'])
+    lr_scheduler = CosineDecayScheduler(config['train']['lr'], config['train']['lr_warmup_steps'], config['train']['steps'])
+    mm_scheduler = CosineDecayScheduler(1 - config['train']['mm'], 0, config['train']['steps'])
+
+    def train(data, step):
+        # data = data.to(device)
+        # x1, x2 = transformer_view_1(data), transformer_view_2(data)
+        x1, x2 = data[0].to(device), data[1].to(device)
+
+        # update learning rate
+        lr = lr_scheduler.get(step)
+        for g in optimizer.param_groups:
+            g['lr'] = lr
+
+        # update momentum
+        mm = 1 - mm_scheduler.get(step)
+
+        # forward
+        optimizer.zero_grad()
+        q1, y2 = model(x1, x2)
+        q2, y1 = model(x2, x1)
+        loss = 2 - cosine_similarity(q1, y2.detach(), dim=-1).mean() - cosine_similarity(q2, y1.detach(), dim=-1).mean()
+
+        loss.backward()
+        # update online network
+        optimizer.step()
+        # update target network
+        model.update_target_network(mm)
+
+        # log scalars
+        writer.add_scalar('params/lr', lr, step)
+        writer.add_scalar('params/mm', mm, step)
+        writer.add_scalar('train/loss', loss, step)
+        return loss
+
+
+    def eval(train_loader, val_loader):
+        tmp_encoder = copy.deepcopy(model.online_encoder).eval()
+
+        x_train, y_train = get_features_from_encoder(tmp_encoder, train_loader)
+        x_test, y_test = get_features_from_encoder(tmp_encoder, val_loader)
+
+        neigh = KNeighborsClassifier()
+        # train_x = x_train.cpu()
+        # train_y = y_train.cpu()
+        neigh.fit(x_train.cpu(), y_train.cpu())
+        score = neigh.score(x_test.cpu(), y_test.cpu())
+
+        # train_data = compute_representations(tmp_encoder, train_dataset, device)
+        # val_data = compute_representations(tmp_encoder, val_dataset, device)
+        # test_data = compute_representations(tmp_encoder, val_dataset, device)
+        #
+        # val_f1, test_f1 = train_linear(6, train_data, val_data, test_data, device)
+        # writer.add_scalar('accuracy/val', val_f1, step)
+        # writer.add_scalar('accuracy/test', test_f1, step)
+        return score
+
+    min_loss = 10.0
+    train_iter = iter(data_loader)
+    for step in tqdm(range(1, config['train']['steps'])):
+        data = next(train_iter, None)
+
+        if data is None:
+            train_iter = iter(data_loader)
+            data = next(train_iter, None)
+
+        loss = train(data, step)
+
+
+
+        if loss < min_loss:
+            min_loss = loss
+            # save encoder weights
+            torch.save({'model': model.online_encoder.state_dict()}, os.path.join('../ckgs/self_supervise_PFC/bgrl-bil_{:.8f}.pt'.format(min_loss)))
+
+            print(f'Step: {step:02d}, Loss: {loss:.8f}')
+
+        if step % 100 == 0:
+            # with torch.no_grad():
+            #     val_knn= eval(train_dataset, val_dataset)
+            #     print(f'val: {val_knn: .8f}')
+            torch.save({'model': model.online_encoder.state_dict()}, os.path.join('../ckgs/self_supervise_PFC/bgrl_{:.8f}.pt'.format(min_loss)))
+
+            # model.eval()
+            # x_train, y_train, name_train = get_features_from_encoder(model, train_loader)
+
+            # from sklearn.neighbors import KNeighborsClassifier
+            #
+            # neigh = KNeighborsClassifier(n_neighbors=3)
+            # train_x = x_train.cpu()
+            # train_y = y_train.cpu()
+            # neigh.fit(x_all.cpu(), y_all.cpu())
+            # z = TSNE(n_components=2, perplexity=30).fit_transform(x_train.cpu())
+            # plot_tne(
+            #     loss,
+            #     z,
+            #     labels=y_train.cpu(),
+            #     targets=['23', '4', '5', '6', 'cp', 'vpm'],
+            #     colors=[colors[0], colors[1], colors[2], colors[3], colors[4], colors[5]]
+            # )
+
