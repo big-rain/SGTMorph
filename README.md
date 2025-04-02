@@ -1,6 +1,6 @@
 self-supervised neuron morphology representation on graph transformer
 1. Data processing
-   pyhon neuron.py
+   python neuron.py
 
 3. Network training
    
@@ -8,4 +8,4 @@ self-supervised neuron morphology representation on graph transformer
       python class_model.py
   
   2.2 self-supervision
-      python 
+      python SGTMorph.py
