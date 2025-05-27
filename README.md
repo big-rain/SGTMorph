@@ -3,7 +3,7 @@
 [![License](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
 
-
+![项目架构图](images/SGTmorph.png)
 
 ✨ This is the offical implementation of paper " self-supervised neuron morphology representation on graph transformer "
 
@@ -46,7 +46,7 @@ For examples on how to load the data, train the model and perform inference with
 
 ## Citation
 
-python main.py --cfg configs/GPS/zinc-GPS+RWSE.yaml  --repeat 1  seed 42  wandb.use False
+
 
 ### 安装
 ```bash
