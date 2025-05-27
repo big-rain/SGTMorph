@@ -4,7 +4,7 @@
 
 
 
-![image](https://github.com/big-rain/SGTMorph/images/SGTMorph.png)
+![image](https://github.com/big-rain/SGTMorph/blob/main/images/SGTMorph.png)
 
 ✨ This is the offical implementation of paper " self-supervised neuron morphology representation on graph transformer "
 
