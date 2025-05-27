@@ -50,7 +50,3 @@ python3 evel/retrieve.py
 
 
 
-### 安装
-```bash
-# 代码块必须使用语言标识
-npm install your-package
