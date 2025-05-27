@@ -1,29 +1,53 @@
 # self-supervised neuron morphology representation on graph transformer 🚀
 
 [![License](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
-[![GitHub Stars](https://img.shields.io/github/stars/username/repo)](https://github.com/username/repo/stargazers)
-[![PRs Welcome](https://img.shields.io/badge/PRs-welcome-brightgreen.svg)](CONTRIBUTING.md)
 
-✨ 一句话描述项目的核心价值
 
-📌 **最新动态**：添加项目重大更新提示（可选）
 
-## 目录 📚
-- [功能特性](#功能特性-)
-- [快速开始](#快速开始-)
-  - [安装](#安装)
-  - [使用示例](#使用示例)
-- [文档](#文档-)
-- [贡献指南](#贡献指南-)
-- [许可证](#许可证-)
 
----
+✨ This is the offical implementation of paper " self-supervised neuron morphology representation on graph transformer "
 
-## 功能特性 ✨
-- ✔️ 核心功能1（使用emoji强调）
-- ✔️ 核心功能2（建议不超过5项）
 
-## 快速开始 🚀
+
+## System Requirements
+### Hardware requirements
+The training of GraphDINO requires a GPU. All trainings for the publication were performed on a NVIDIA Quadro RTX 4070ti single GPU.
+The code was developed and tested on pytorch 2.1.
+
+## Data
+
+
+
+### Data preprocessing.
+```
+python3 dataloader/ACT.py
+```
+
+
+## Training
+### supervised
+
+```
+python3 model/class_model.py
+```
+
+### self-supervised
+
+```
+python3 model/SGTMorph.py
+```
+
+The training code will write checkpoint files of the model weights to the checkpoint directory specified in the config file.
+
+
+## Demos
+For examples on how to load the data, train the model and perform inference with a pretrained model, see Jupyter notebooks in the
+
+
+## Citation
+
+python main.py --cfg configs/GPS/zinc-GPS+RWSE.yaml  --repeat 1  seed 42  wandb.use False
+
 ### 安装
 ```bash
 # 代码块必须使用语言标识
