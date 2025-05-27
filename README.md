@@ -3,7 +3,7 @@
 [![License](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
 
-![项目架构图](.images/SGTMorph.png)
+![项目架构图](images/SGTMorph.png)
 
 ✨ This is the offical implementation of paper " self-supervised neuron morphology representation on graph transformer "
 
